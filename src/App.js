@@ -1,106 +1,126 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 import SpotifyWebApi from 'spotify-web-api-js';
 
 const spotifyApi = new SpotifyWebApi();
 
+const CLIENT_ID = process.env.REACT_APP_SPOTIFY_CLIENT_ID; // set in .env.local
+const REDIRECT_URI = process.env.REACT_APP_SPOTIFY_REDIRECT_URI;
+const SCOPES = 'playlist-read-private playlist-read-collaborative';
+const CODE_VERIFIER_KEY = 'spotify_code_verifier';
 
+// Login uses the Authorization Code flow with PKCE, so no client secret is
+// ever needed in the browser. Instead, each login creates a random "code
+// verifier", sends its SHA-256 hash to Spotify, and later proves it started
+// the login by sending the original verifier.
+const base64UrlEncode = (bytes) =>
+  btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+const generateCodeVerifier = () =>
+  base64UrlEncode(crypto.getRandomValues(new Uint8Array(64)));
+
+const generateCodeChallenge = async (codeVerifier) => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+  return base64UrlEncode(new Uint8Array(digest));
+};
+
+// Exchanges a login code or a refresh token for a new access token
+const requestToken = async (params) => {
+  const response = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ client_id: CLIENT_ID, ...params }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error_description || data.error);
+  }
+  return data;
+};
 
 const SpotifyLogin = () => {
   const [authToken, setAuthToken] = useState('');
   const [playlists, setPlaylists] = useState([]);
-  const [refreshToken, setRefreshToken] = useState('');  // Store the refresh token
+  const refreshTokenRef = useRef('');  // Not shown on screen, so a ref avoids extra re-renders
 
-  const CLIENT_ID = process.env.REACT_APP_SPOTIFY_CLIENT_ID;//key in .env file 
-  const REDIRECT_URI = process.env.REACT_APP_SPOTIFY_REDIRECT_URI;
+  const handleAuth = async () => {
+    const codeVerifier = generateCodeVerifier();
+    window.localStorage.setItem(CODE_VERIFIER_KEY, codeVerifier);  // Needed again after Spotify redirects back
 
-  const handleAuth = () => {
-    console.log('Triggering Spotify login');
-    const AUTH_URL = `https://accounts.spotify.com/authorize?client_id=${CLIENT_ID}&response_type=token&redirect_uri=${REDIRECT_URI}&scope=playlist-read-private playlist-read-collaborative`;
-    window.location.href = AUTH_URL;
+    const params = new URLSearchParams({
+      client_id: CLIENT_ID,
+      response_type: 'code',
+      redirect_uri: REDIRECT_URI,
+      scope: SCOPES,
+      code_challenge_method: 'S256',
+      code_challenge: await generateCodeChallenge(codeVerifier),
+    });
+    window.location.href = `https://accounts.spotify.com/authorize?${params}`;
   };
 
-  const fetchPlaylists = async () => {
+  const saveTokens = useCallback((data) => {
+    spotifyApi.setAccessToken(data.access_token);
+    setAuthToken(data.access_token);
+    // Spotify may send a new refresh token; if it doesn't, keep using the old one
+    if (data.refresh_token) {
+      refreshTokenRef.current = data.refresh_token;
+    }
+  }, []);
+
+  const fetchPlaylists = useCallback(async () => {
     try {
-      console.log('Fetching playlists with token:', authToken);  // Debug log
       const playlistsResponse = await spotifyApi.getUserPlaylists();
-      console.log('Fetched playlists response:', playlistsResponse); // Debug log
       setPlaylists(playlistsResponse.items); // Update playlists state with fetched data
     } catch (error) {
-      console.error('Error fetching playlists:', error);
-      if (error.status === 401 && refreshToken) {
-        // If token expired, try refreshing the token
-        await refreshAccessToken();
+      if (error.status !== 401 || !refreshTokenRef.current) {
+        console.error('Error fetching playlists:', error);
+        return;
+      }
+
+      // Access tokens expire after an hour, so get a new one and try once more
+      try {
+        saveTokens(await requestToken({
+          grant_type: 'refresh_token',
+          refresh_token: refreshTokenRef.current,
+        }));
+        const playlistsResponse = await spotifyApi.getUserPlaylists();
+        setPlaylists(playlistsResponse.items);
+      } catch (retryError) {
+        console.error('Error refreshing token:', retryError);
       }
     }
-  };
-
-  const refreshAccessToken = async () => {
-    const params = new URLSearchParams();
-    params.append('grant_type', 'refresh_token');
-    params.append('refresh_token', refreshToken);
-    params.append('client_id', 'your_client_id');  // Replace with your Spotify Client ID
-    params.append('client_secret', 'your_client_secret');  // Replace with your Spotify Client Secret
-
-    try {
-      const response = await fetch('https://accounts.spotify.com/api/token', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: params,
-      });
-
-      const data = await response.json();
-      if (data.access_token) {
-        console.log('New access token:', data.access_token);
-        spotifyApi.setAccessToken(data.access_token);
-        window.localStorage.setItem('spotify_auth_token', data.access_token);  // Save new access token
-        setAuthToken(data.access_token);
-        fetchPlaylists();  // Retry fetching playlists
-      } else {
-        console.error('Error refreshing token:', data);
-      }
-    } catch (error) {
-      console.error('Error refreshing token:', error);
-    }
-  };
+  }, [saveTokens]);
 
   useEffect(() => {
-
-    window.localStorage.removeItem('spotify_auth_token');
-
-    // Check for token in the URL after redirect
-    const handleHashChange = () => {
-      const hash = window.location.hash;
-      if (hash.includes('access_token')) {
-        const urlParams = new URLSearchParams(hash.replace('#', '?'));
-        const newAuthToken = urlParams.get('access_token');
-        const newRefreshToken = urlParams.get('refresh_token');  // Get the refresh token
-        setAuthToken(newAuthToken);
-        setRefreshToken(newRefreshToken);  // Store the refresh token
-        window.localStorage.setItem('spotify_auth_token', newAuthToken);  // Save access token in local storage
-        spotifyApi.setAccessToken(newAuthToken);
-        fetchPlaylists();
-      }
-    };
-
-    // Check if token exists in URL (after redirect from Spotify)
-    const hash = window.location.hash;
-    if (hash) {
-      handleHashChange();
-    } else {
-      // If no token in URL, show login button
-      setAuthToken('');
+    // After login, Spotify redirects back here with ?code=... in the URL
+    const code = new URLSearchParams(window.location.search).get('code');
+    if (!code) {
+      return;
     }
-    
 
-    window.addEventListener('hashchange', handleHashChange);
+    // Remove the code from the address bar so refreshing the page doesn't reuse it
+    window.history.replaceState({}, document.title, window.location.pathname);
+    const codeVerifier = window.localStorage.getItem(CODE_VERIFIER_KEY);
+    window.localStorage.removeItem(CODE_VERIFIER_KEY);
 
-    return () => {
-      window.removeEventListener('hashchange', handleHashChange);
-    };
-  }, [authToken]);
+    requestToken({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI,
+      code_verifier: codeVerifier,
+    })
+      .then((data) => {
+        saveTokens(data);
+        return fetchPlaylists();
+      })
+      .catch((error) => console.error('Error logging in:', error));
+  }, [saveTokens, fetchPlaylists]);
 
   return (
     <div className="App">
