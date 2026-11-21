@@ -1,13 +1,17 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 import SpotifyWebApi from 'spotify-web-api-js';
+import MusicBackground from './MusicBackground';
+import PlaylistView from './PlaylistView';
+import { fetchAllPlaylists } from './spotifySync';
 
 const spotifyApi = new SpotifyWebApi();
 
 const CLIENT_ID = process.env.REACT_APP_SPOTIFY_CLIENT_ID; // set in .env.local
 const REDIRECT_URI = process.env.REACT_APP_SPOTIFY_REDIRECT_URI;
-const SCOPES = 'playlist-read-private playlist-read-collaborative';
+const SCOPES = 'playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public';
 const CODE_VERIFIER_KEY = 'spotify_code_verifier';
+const REFRESH_TOKEN_KEY = 'spotify_refresh_token';
 
 // Login uses the Authorization Code flow with PKCE, so no client secret is
 // ever needed in the browser. Instead, each login creates a random "code
@@ -44,10 +48,23 @@ const requestToken = async (params) => {
   return data;
 };
 
+// Waits before retrying when Spotify says we're sending requests too fast
+const wait = (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+
+// Which playlist is open is kept in the address bar (?playlist=...), so the
+// browser's back button and refreshing the page both work
+const playlistIdFromUrl = () => new URLSearchParams(window.location.search).get('playlist');
+
 const SpotifyLogin = () => {
   const [authToken, setAuthToken] = useState('');
-  const [playlists, setPlaylists] = useState([]);
+  const [playlists, setPlaylists] = useState(null);  // null while loading
+  const [selectedId, setSelectedId] = useState(playlistIdFromUrl);
+  const [userId, setUserId] = useState('');
+  // True while a saved login is being checked, so the login button doesn't flash up
+  const [restoring, setRestoring] = useState(() => Boolean(window.localStorage.getItem(REFRESH_TOKEN_KEY)));
   const refreshTokenRef = useRef('');  // Not shown on screen, so a ref avoids extra re-renders
+  // React runs startup effects twice in development; a saved login can only be used once
+  const loginStartedRef = useRef(false);
 
   const handleAuth = async () => {
     const codeVerifier = generateCodeVerifier();
@@ -67,151 +84,209 @@ const SpotifyLogin = () => {
   const saveTokens = useCallback((data) => {
     spotifyApi.setAccessToken(data.access_token);
     setAuthToken(data.access_token);
-    // Spotify may send a new refresh token; if it doesn't, keep using the old one
+    // Spotify may send a new refresh token; if it doesn't, keep using the old one.
+    // It's saved so you stay logged in after refreshing the page.
     if (data.refresh_token) {
       refreshTokenRef.current = data.refresh_token;
+      window.localStorage.setItem(REFRESH_TOKEN_KEY, data.refresh_token);
     }
   }, []);
 
-  const fetchPlaylists = useCallback(async () => {
-    try {
-      const playlistsResponse = await spotifyApi.getUserPlaylists();
-      setPlaylists(playlistsResponse.items); // Update playlists state with fetched data
-    } catch (error) {
-      if (error.status !== 401 || !refreshTokenRef.current) {
-        console.error('Error fetching playlists:', error);
-        return;
-      }
+  const handleLogout = () => {
+    window.localStorage.removeItem(REFRESH_TOKEN_KEY);
+    refreshTokenRef.current = '';
+    spotifyApi.setAccessToken(null);
+    setAuthToken('');
+    setPlaylists(null);
+    setSelectedId(null);
+    window.history.replaceState({}, document.title, window.location.pathname);
+  };
 
-      // Access tokens expire after an hour, so get a new one and try once more
+  // Runs a Spotify request, e.g. callSpotify((api) => api.getMe()).
+  // Access tokens expire after an hour, so on a 401 it gets a new one and tries again.
+  // If Spotify says to slow down (429), it waits as long as Spotify asks.
+  const callSpotify = useCallback(async (request) => {
+    for (let attempt = 1; ; attempt++) {
       try {
-        saveTokens(await requestToken({
-          grant_type: 'refresh_token',
-          refresh_token: refreshTokenRef.current,
-        }));
-        const playlistsResponse = await spotifyApi.getUserPlaylists();
-        setPlaylists(playlistsResponse.items);
-      } catch (retryError) {
-        console.error('Error refreshing token:', retryError);
+        return await request(spotifyApi);
+      } catch (error) {
+        if (attempt >= 4) {
+          throw error;
+        }
+        if (error.status === 429) {
+          await wait(Number(error.getResponseHeader?.('Retry-After')) || 1);
+        } else if (error.status === 401 && refreshTokenRef.current && attempt === 1) {
+          saveTokens(await requestToken({
+            grant_type: 'refresh_token',
+            refresh_token: refreshTokenRef.current,
+          }));
+        } else {
+          throw error;
+        }
       }
     }
   }, [saveTokens]);
 
+  const fetchPlaylists = useCallback(async () => {
+    try {
+      const [me, allPlaylists] = await Promise.all([
+        callSpotify((api) => api.getMe()),
+        fetchAllPlaylists(callSpotify),
+      ]);
+      setUserId(me.id);
+      setPlaylists(allPlaylists);
+    } catch (error) {
+      console.error('Error fetching playlists:', error);
+      setPlaylists((current) => current || []);
+    }
+  }, [callSpotify]);
+
+  const openPlaylist = useCallback((playlistId) => {
+    window.history.pushState({}, '', `${window.location.pathname}?playlist=${playlistId}`);
+    setSelectedId(playlistId);
+    window.scrollTo(0, 0);
+  }, []);
+
+  const closePlaylist = () => {
+    window.history.pushState({}, '', window.location.pathname);
+    setSelectedId(null);
+  };
+
+  useEffect(() => {
+    const handleBackOrForward = () => setSelectedId(playlistIdFromUrl());
+    window.addEventListener('popstate', handleBackOrForward);
+    return () => window.removeEventListener('popstate', handleBackOrForward);
+  }, []);
+
   useEffect(() => {
     // After login, Spotify redirects back here with ?code=... in the URL
     const code = new URLSearchParams(window.location.search).get('code');
-    if (!code) {
+    const savedRefreshToken = window.localStorage.getItem(REFRESH_TOKEN_KEY);
+    if (loginStartedRef.current || (!code && !savedRefreshToken)) {
       return;
     }
+    loginStartedRef.current = true;
 
-    // Remove the code from the address bar so refreshing the page doesn't reuse it
-    window.history.replaceState({}, document.title, window.location.pathname);
-    const codeVerifier = window.localStorage.getItem(CODE_VERIFIER_KEY);
-    window.localStorage.removeItem(CODE_VERIFIER_KEY);
+    let login;
+    if (code) {
+      // Remove the code from the address bar so refreshing the page doesn't reuse it
+      window.history.replaceState({}, document.title, window.location.pathname);
+      const codeVerifier = window.localStorage.getItem(CODE_VERIFIER_KEY);
+      window.localStorage.removeItem(CODE_VERIFIER_KEY);
+      login = requestToken({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+        code_verifier: codeVerifier,
+      });
+    } else {
+      login = requestToken({ grant_type: 'refresh_token', refresh_token: savedRefreshToken });
+    }
 
-    requestToken({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: REDIRECT_URI,
-      code_verifier: codeVerifier,
-    })
+    login
       .then((data) => {
         saveTokens(data);
         return fetchPlaylists();
       })
-      .catch((error) => console.error('Error logging in:', error));
+      .catch((error) => {
+        console.error('Error logging in:', error);
+        window.localStorage.removeItem(REFRESH_TOKEN_KEY);  // The saved login no longer works
+      })
+      .finally(() => setRestoring(false));
   }, [saveTokens, fetchPlaylists]);
+
+  const selectedPlaylist = playlists?.find((playlist) => playlist.id === selectedId);
+
+  const loading = (
+    <p className="loading" role="status">
+      <span className="equalizer" aria-hidden="true"><span /><span /><span /></span>
+      Loading ahhhh...
+    </p>
+  );
+
+  let page;
+  if (!authToken) {
+    page = restoring ? (
+      <section className="card login-card">{loading}</section>
+    ) : (
+      <section className="card login-card">
+        <p>Connect your Spotify account to see your playlists.</p>
+        <button className="login-button" onClick={handleAuth}>Log in with Spotify</button>
+      </section>
+    );
+  } else if (selectedId && !playlists) {
+    page = <section className="card">{loading}</section>;
+  } else if (selectedId && !selectedPlaylist) {
+    page = (
+      <section className="card playlist-view">
+        <button className="back-button" onClick={closePlaylist}>← All playlists</button>
+        <p className="playlist-note">That playlist isn't in your library.</p>
+      </section>
+    );
+  } else if (selectedPlaylist) {
+    page = (
+      <PlaylistView
+        key={selectedPlaylist.id}
+        playlist={selectedPlaylist}
+        playlists={playlists}
+        userId={userId}
+        callSpotify={callSpotify}
+        onBack={closePlaylist}
+        onOpenPlaylist={openPlaylist}
+        onPlaylistsChanged={fetchPlaylists}
+      />
+    );
+  } else {
+    page = (
+      <section className="card">
+        <h2 className="section-title">Your Playlists</h2>
+        {!playlists ? loading : playlists.length === 0 ? (
+          <p className="playlist-note">You don't have any playlists yet.</p>
+        ) : (
+          <ul className="playlist-grid">
+            {playlists.map((playlist) => {
+              const cover = playlist.images?.[0]?.url;
+              const trackCount = playlist.tracks?.total;
+              return (
+                <li key={playlist.id}>
+                  <button className="playlist-card" onClick={() => openPlaylist(playlist.id)}>
+                    {cover ? (
+                      <img className="playlist-cover" src={cover} alt="" loading="lazy" />
+                    ) : (
+                      <span className="playlist-cover playlist-cover--empty" aria-hidden="true">♪</span>
+                    )}
+                    <span className="playlist-name" title={playlist.name}>{playlist.name}</span>
+                    {trackCount !== undefined && (
+                      <span className="playlist-meta">{trackCount} {trackCount === 1 ? 'track' : 'tracks'}</span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+    );
+  }
 
   return (
     <div className="App">
-      <h1>Spotify Playlist Manager</h1>
-      {!authToken ? (
-        <button onClick={handleAuth}>Log in with Spotify</button>
-      ) : (
-        <div>
-          <h3>Your Playlists</h3>
-          {playlists.length > 0 ? (
-            <ul>
-              {playlists.map((playlist) => (
-                <li key={playlist.id}>
-                  <h4>{playlist.name}</h4>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>Loading ahhhh...</p>
-          )}
-        </div>
-      )}
+      <MusicBackground />
+      <main className="content">
+        {authToken && (
+          <button className="logout-button" onClick={handleLogout}>Log out</button>
+        )}
+        <header className="hero">
+          <h1 className="title">
+            Spotify Playlist <span className="title-accent">Organizer</span>
+          </h1>
+          <p className="tagline">Bring some order to your playlists.</p>
+        </header>
+
+        {page}
+      </main>
     </div>
   );
 };
 
 export default SpotifyLogin;
-
-
-
-/*
-
- const [selectedTrack, setSelectedTrack] = useState(null);
-  const [newPosition, setNewPosition] = useState('');
-
- // Fetch tracks in playlist
- const fetchTracks = async (playlistId) => {
-  try {
-    const data = await spotifyApi.getPlaylistTracks(playlistId);
-    return data.items;
-  } catch (error) {
-    console.error('Error fetching tracks:', error);
-  }
-};
-
-  useEffect(() => {
-    // Get access token from the URL
-    const hash = window.location.hash;
-    let authToken = window.localStorage.getItem('spotify_auth_token');
-  
-    if (!authToken && hash) {
-      const urlParams = new URLSearchParams(window.location.hash.replace('#', '?'));
-      authToken = urlParams.get('access_token');
-      window.localStorage.setItem('spotify_auth_token', authToken); // Save token in local storage
-    }
-  
-    if (authToken) {
-      spotifyApi.setAccessToken(authToken);
-      setAuthToken(authToken); 
-      fetchPlaylists(authToken); // Fetch playlists after authentication
-    }
-  }, []);
- 
-
-
-  // Track reordering
-  const handleReorder = async (playlistId, trackIndex, newPosition) => {
-    try {
-      const tracks = await fetchTracks(playlistId);
-      if (newPosition < 1 || newPosition > tracks.length) {
-        alert('Invalid position');
-        return;
-      }
-
-      const rangeStart = trackIndex;
-      const rangeLength = 1;
-      const insertBefore = newPosition - 1;
-
-      // Link Spotify API
-      await spotifyApi.reorderTracksInPlaylist(playlistId, rangeStart, rangeLength, insertBefore);
-      alert(`Moved track to position ${newPosition}`);
-
-      // Re-fetch the updated playlist to reflect the changes
-      const updatedTracks = await fetchTracks(playlistId);
-      setPlaylists((prevPlaylists) =>
-        prevPlaylists.map((playlist) =>
-          playlist.id === playlistId ? { ...playlist, tracks: updatedTracks } : playlist
-        )
-      );
-    } catch (error) {
-      console.error('Error reordering track:', error);
-    }
-  };
- */
